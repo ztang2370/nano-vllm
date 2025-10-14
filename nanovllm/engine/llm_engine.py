@@ -1,4 +1,5 @@
 import atexit
+import logging
 from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
@@ -10,6 +11,9 @@ from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
+from nanovllm.engine.op_replica import ReplicaManager, ReplicaConfig
+
+logger = logging.getLogger(__name__)
 
 
 class LLMEngine:
@@ -27,13 +31,85 @@ class LLMEngine:
             process.start()
             self.ps.append(process)
             self.events.append(event)
+        # Initialize operator replica manager
+        replica_config = ReplicaConfig(
+            num_replicas_per_device=1,  # Default, will be overridden by op configs
+            replica_devices=config.replica_devices,
+            auto_scaling_enabled=config.enable_op_replica_auto_scaling,
+        )
+        self.replica_manager = ReplicaManager(replica_config)
+
+        # Set replica manager in the model for attention layers to use BEFORE creating ModelRunner
+        from nanovllm.models.qwen3 import set_attention_replica_manager
+        set_attention_replica_manager(self.replica_manager)
+
         self.model_runner = ModelRunner(config, 0, self.events)
+
+        # Initialize attention replicas if configured (needs to happen after model is loaded)
+        self._init_attention_replicas(config)
+
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+
         atexit.register(self.exit)
 
+    def _extract_attention_weights(self) -> dict:
+        """Extract attention configuration and weights from the model for replication."""
+        # Find Qwen3Attention layers in the model to extract config and weights
+        attention_config = {}
+        for name, module in self.model_runner.model.named_modules():
+            if module.__class__.__name__ == 'Qwen3Attention':
+                # Store the Qwen3Attention instance for later use
+                attention_config = {
+                    'module': module,
+                    'num_heads': module.num_heads,
+                    'head_dim': module.head_dim,
+                    'scale': module.scaling,
+                    'num_kv_heads': module.num_kv_heads,
+                    'weights': dict(module.state_dict())
+                }
+                break
+        return attention_config
+
+    def _init_attention_replicas(self, config: Config) -> None:
+        """Initialize attention operator replicas if configured."""
+        if "attention" in config.op_replica_configs:
+            num_replicas = config.op_replica_configs["attention"]
+
+            # Get attention configuration and weights from the model
+            attention_config = self._extract_attention_weights()
+
+            if not attention_config:
+                logger.warning("Could not find Qwen3Attention module for replication")
+                return
+
+            # Create workspace factory for attention
+            def attention_workspace_factory(device):
+                # For now, return empty workspace - attention doesn't need extra workspace
+                # beyond what's already in the Attention class
+                return {}
+
+            # Create replicas across configured devices
+            self.replica_manager.create_replicas(
+                op_name="attention",
+                op_class=self._get_attention_class(),
+                weights_cpu=attention_config,  # Pass full config including constructor params
+                devices=config.replica_devices,
+                workspace_factory=attention_workspace_factory,
+                num_replicas_per_device=num_replicas,
+            )
+
+    def _get_attention_class(self):
+        """Get the Attention class for replication."""
+        from nanovllm.layers.attention import Attention
+        return Attention
+
     def exit(self):
+        # Shutdown replica manager first
+        if hasattr(self, 'replica_manager'):
+            self.replica_manager.shutdown()
+
         self.model_runner.call("exit")
         del self.model_runner
         for p in self.ps:
