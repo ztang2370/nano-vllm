@@ -100,6 +100,11 @@ class LLMEngine:
                 num_replicas_per_device=num_replicas,
             )
 
+            # Add the original attention as a special "replica 0"
+            # This allows the original attention operator to also be utilized for load balancing
+            original_attention_module = attention_config['module']
+            self.replica_manager.add_original_attention_replica("attention", original_attention_module)
+
     def _get_attention_class(self):
         """Get the Attention class for replication."""
         from nanovllm.layers.attention import Attention
@@ -119,12 +124,22 @@ class LLMEngine:
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
+
+
         self.scheduler.add(seq)
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids)
+
+        # Clear batch replica cache only if all sequences in batch are finished
+        # This allows continuing sequences to keep their replica assignment
+        if hasattr(self, 'replica_manager') and self.replica_manager:
+            all_finished = all(seq.is_finished for seq in seqs)
+            if all_finished:
+                self.replica_manager.clear_batch_replicas()
+
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
         return outputs, num_tokens

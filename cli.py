@@ -17,6 +17,7 @@ def parse_args():
     # Model configuration
     parser.add_argument("model", help="Path to model directory")
     parser.add_argument("--prompt", "-p", help="Single prompt to generate from")
+    parser.add_argument("--prompts", help="Multiple prompts (comma-separated)")
     parser.add_argument("--interactive", "-i", action="store_true", help="Run in interactive mode")
 
     # Generation parameters
@@ -80,10 +81,12 @@ def main():
 
         if args.interactive:
             run_interactive(llm, args)
+        elif args.prompts:
+            run_multiple_prompts(llm, args)
         elif args.prompt:
             run_single_prompt(llm, args)
         else:
-            print("Use --prompt or --interactive mode")
+            print("Use --prompt, --prompts, or --interactive mode")
             sys.exit(1)
 
     except Exception as e:
@@ -105,7 +108,37 @@ def run_single_prompt(llm, args):
     outputs = llm.generate([args.prompt], sampling_params)
 
     print("\nCompletion:")
-    print(outputs[0]['text'])
+    print(outputs[0])
+
+
+def run_multiple_prompts(llm, args):
+    """Run multiple concurrent prompts to test operator replicas."""
+    # Parse comma-separated prompts
+    prompts = [p.strip() for p in args.prompts.split(',') if p.strip()]
+
+    if len(prompts) < 2:
+        print("Error: --prompts requires at least 2 prompts for concurrent testing")
+        return
+
+    sampling_params = SamplingParams(
+        temperature=args.temperature,
+        max_tokens=args.max_tokens,
+        # Note: top_p and top_k not supported by current SamplingParams
+    )
+
+    print(f"Running {len(prompts)} concurrent prompts:")
+    for i, prompt in enumerate(prompts):
+        print(f"  {i+1}: {prompt}")
+    print("Generating...")
+    print()
+
+    outputs = llm.generate(prompts, sampling_params)
+
+    print("Completions:")
+    for i, (prompt, output) in enumerate(zip(prompts, outputs)):
+        print(f"{i+1}. Prompt: {prompt}")
+        print(f"   Completion: {output['text']}")
+        print()
 
 
 def run_interactive(llm, args):

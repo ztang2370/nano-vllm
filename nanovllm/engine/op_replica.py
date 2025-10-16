@@ -125,6 +125,7 @@ class OperatorReplica:
     def forward_async(
         self,
         *args,
+        context=None,
         **kwargs
     ) -> Tuple[torch.Tensor, torch.cuda.Event]:
         """
@@ -137,6 +138,7 @@ class OperatorReplica:
         Returns:
             Tuple of (output_tensor, completion_event)
         """
+        print(f"DEBUG: Additional replica forward_async called")
         with self._lock:
             self.metrics.in_flight_count += 1
             self.metrics.busy = True
@@ -158,6 +160,16 @@ class OperatorReplica:
         # Record start event for latency measurement
         start_event = torch.cuda.Event()
         start_event.record()
+
+        # Set context temporarily if provided (for flash_attn compatibility)
+        if context is not None:
+            from nanovllm.utils.context import set_context
+            # Transfer context tensors to replica device if they exist
+            context_dict = context.__dict__.copy()
+            for key, value in context_dict.items():
+                if isinstance(value, torch.Tensor):
+                    context_dict[key] = value.to(self.device)
+            set_context(**context_dict)
 
         # Execute on default stream for now (streams may cause issues with flash_attn)
         # TODO: Fix stream synchronization for flash_attn compatibility
@@ -206,6 +218,7 @@ class ReplicaManager:
         self._lock = threading.Lock()
         self._shutdown_event = threading.Event()
         self._initialized = False  # Flag to indicate when replicas are ready
+        self._batch_replica = {}  # Cache replica per batch: {op_name: replica}
 
         # Auto-scaling components
         self.auto_scaler: Optional[ReplicaAutoScaler] = None
@@ -256,12 +269,11 @@ class ReplicaManager:
                         logger.error(f"Failed to create {op_name} replica on device {device_idx}: {e}")
                         raise
 
-            print(f"DEBUG: Finished creating replicas, {op_name} now has {len(self.replicas[op_name])} replicas")
             self._initialized = True
 
     def get_replica(self, op_name: str) -> Optional[OperatorReplica]:
         """
-        Get the next available replica for the operator using round-robin scheduling.
+        Get an available replica for the operator using round-robin assignment.
 
         Args:
             op_name: Name of the operator
@@ -274,13 +286,25 @@ class ReplicaManager:
         if op_name not in self.replicas or not self.replicas[op_name]:
             return None
 
+        # Check if we already selected a replica for this batch
+        if op_name in self._batch_replica:
+            return self._batch_replica[op_name]
+
         replicas = self.replicas[op_name]
-        # Simple round-robin for now (can be enhanced with load balancing)
+
+        # Use round-robin assignment for load balancing across batches
         idx = self._round_robin_idx[op_name]
-        replica = replicas[idx]
         self._round_robin_idx[op_name] = (idx + 1) % len(replicas)
 
+        replica = replicas[idx]
+        # Cache this replica for the current batch
+        self._batch_replica[op_name] = replica
+        print(f"BATCH_ASSIGN: Batch -> attention replica {idx}")
         return replica
+
+    def clear_batch_replicas(self):
+        """Clear the batch replica cache after each batch is processed."""
+        self._batch_replica.clear()
 
     def add_replica(self, op_name: str, device: int) -> bool:
         """
@@ -361,6 +385,77 @@ class ReplicaManager:
                         continue
 
             return False
+
+    def add_original_attention_replica(self, op_name: str, original_attention_module) -> None:
+        """
+        Add the original attention module as a special "replica" so it can be utilized
+        for load balancing during bursty requests.
+
+        Args:
+            op_name: Name of the operator (should be "attention")
+            original_attention_module: The original Qwen3Attention module instance
+        """
+        with self._lock:
+            if op_name not in self.replicas:
+                logger.warning(f"No replicas exist for {op_name}, cannot add original attention replica")
+                return
+
+            # Create a special OperatorReplica that replicates the original attention logic
+            class OriginalAttentionReplica:
+                def __init__(self, original_module):
+                    self.device = original_module.attn.device if hasattr(original_module.attn, 'device') else torch.device('cuda:0')
+                    self.original_module = original_module
+                    self.metrics = ReplicaMetrics()
+                    self._lock = threading.Lock()
+                    self.scale = original_module.attn.scale
+
+                    # Share KV cache with the original attention module
+                    self.k_cache = original_module.attn.k_cache
+                    self.v_cache = original_module.attn.v_cache
+
+                def forward_async(self, q, k, v, context=None):
+                    """Execute attention computation with proper KV cache management."""
+                    print(f"DEBUG: Replica 0 forward_async called, q.shape={q.shape}")
+                    with self._lock:
+                        self.metrics.in_flight_count += 1
+                        self.metrics.busy = True
+
+                        # Set context if provided
+                        if context is not None:
+                            from nanovllm.utils.context import set_context
+                            context_dict = context.__dict__.copy()
+                            for key, value in context_dict.items():
+                                if isinstance(value, torch.Tensor):
+                                    context_dict[key] = value.to(self.device)
+                            set_context(**context_dict)
+
+                        # Call the original attention method directly (it will use the shared KV cache)
+                        print(f"DEBUG: Replica 0 calling original attention")
+                        o = self.original_module.attn(q, k, v)
+                        print(f"DEBUG: Replica 0 attention completed, o.shape={o.shape}")
+
+                        # Create event for synchronization
+                        event = torch.cuda.Event()
+                        event.record(torch.cuda.current_stream(self.device))
+
+                        self.metrics.in_flight_count -= 1
+                        self.metrics.busy = False
+
+                        return o, event
+
+                def synchronize(self):
+                    """Synchronize the original attention's stream."""
+                    torch.cuda.synchronize(self.device)
+
+                def is_idle(self, timeout_ms):
+                    """Check if this replica is idle."""
+                    return not self.metrics.busy
+
+            # Insert the original attention replica at the beginning of the list
+            original_replica = OriginalAttentionReplica(original_attention_module)
+            self.replicas[op_name].insert(0, original_replica)
+            print(f"DEBUG: Added original attention as replica 0 for {op_name}")
+            logger.info(f"Added original attention as replica 0 for {op_name}")
 
     def get_metrics(self, op_name: str) -> List[ReplicaMetrics]:
         """Get metrics for all replicas of an operator."""

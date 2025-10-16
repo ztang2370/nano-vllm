@@ -61,45 +61,79 @@ class Attention(nn.Module):
         # Note: The actual weights are managed by the parent Qwen3Attention module
         # This is just for API compatibility with the replica system
         self.replica_weights = weights
+        self.is_replica = weights is not None
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
-        # Check if this is a replica instance (weights provided indicates replica mode)
-        if hasattr(self, 'replica_weights') and self.replica_weights is not None:
-            # Replica mode - use PyTorch attention
-            return self._replica_forward(q, k, v)
-
-        # Original implementation
         context = get_context()
-        k_cache, v_cache = self.k_cache, self.v_cache
-        if k_cache.numel() and v_cache.numel():
-            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
-        if context.is_prefill:
-            if context.block_tables is not None:    # prefix cache
-                k, v = k_cache, v_cache
-            o = flash_attn_varlen_func(q, k, v,
-                                       max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
-                                       max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
-                                       softmax_scale=self.scale, causal=True, block_table=context.block_tables)
-        else:    # decode
-            o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
-                                        cache_seqlens=context.context_lens, block_table=context.block_tables,
-                                        softmax_scale=self.scale, causal=True)
-        return o
+
+        # Check if this instance has KV cache (original attention) vs replica
+        has_kv_cache = hasattr(self, 'k_cache') and self.k_cache is not None and self.k_cache.numel() > 0
+
+        if has_kv_cache:
+            # Original attention with KV cache - use flash_attn
+            k_cache, v_cache = self.k_cache, self.v_cache
+            if k_cache.numel() and v_cache.numel():
+                store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+            if context.is_prefill:
+                if context.block_tables is not None:    # prefix cache
+                    k, v = k_cache, v_cache
+                o = flash_attn_varlen_func(q, k, v,
+                                           max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
+                                           max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
+                                           softmax_scale=self.scale, causal=True, block_table=context.block_tables)
+            else:    # decode
+                o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
+                                            cache_seqlens=context.context_lens, block_table=context.block_tables,
+                                            softmax_scale=self.scale, causal=True)
+                o = o.squeeze(1)  # Remove the extra dimension added by unsqueeze(1)
+            return o
+        else:
+            # Replica mode - use flash_attn without KV cache (stateless)
+            if context is not None:
+                o = flash_attn_varlen_func(q, k, v,
+                                           max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
+                                           max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
+                                           softmax_scale=self.scale, causal=True, block_table=context.block_tables)
+                return o
+            else:
+                # Fallback to simplified attention if no context
+                return self._replica_forward(q, k, v)
 
     def _replica_forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         """
-        Use the original attention logic but without flash_attn dependencies.
+        Simplified batched attention computation.
+        Input: [total_tokens, num_heads, head_dim] where total_tokens may span multiple sequences
         """
-        # Original logic from forward() but without context/KV cache
-        k_cache, v_cache = self.k_cache, self.v_cache
-        if k_cache.numel() and v_cache.numel():
-            store_kvcache(k, v, k_cache, v_cache, torch.tensor([-1], device=q.device))  # dummy slot
-            k, v = k_cache, v_cache
+        total_tokens, num_q_heads, head_dim = q.shape
+        _, num_kv_heads, _ = k.shape
 
-        # Simple attention without flash_attn - just compute q @ k^T @ v
-        # For decode mode, this is approximate but should work
-        scale = self.scale
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
-        attn_weights = torch.softmax(attn_weights, dim=-1)
-        o = torch.matmul(attn_weights, v)
-        return o
+        # Handle GQA: expand k,v to match query heads
+        if num_q_heads != num_kv_heads:
+            repeat_factor = num_q_heads // num_kv_heads
+            k = k.repeat(1, repeat_factor, 1)  # [total_tokens, num_heads, head_dim]
+            v = v.repeat(1, repeat_factor, 1)  # [total_tokens, num_heads, head_dim]
+
+        # Use PyTorch's efficient batched attention
+        # Reshape to [batch_size=1, seq_len, num_heads, head_dim] for scaled_dot_product_attention
+        # But since we have variable sequence lengths, we need to handle this differently
+
+        # For simplicity, treat the entire input as one long sequence with causal masking
+        # This approximates the behavior of flash_attn for batched inputs
+
+        # Reshape for attention: [num_heads, total_tokens, head_dim]
+        q = q.transpose(0, 1)  # [num_heads, total_tokens, head_dim]
+        k = k.transpose(0, 1)  # [num_heads, total_tokens, head_dim]
+        v = v.transpose(0, 1)  # [num_heads, total_tokens, head_dim]
+
+        # Use PyTorch's scaled_dot_product_attention with causal masking
+        output = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,  # Let is_causal handle masking
+            dropout_p=0.0,
+            is_causal=True,  # Enable causal attention automatically
+            scale=self.scale
+        )
+
+        # Transpose back: [num_heads, total_tokens, head_dim] -> [total_tokens, num_heads, head_dim]
+        output = output.transpose(0, 1)
+        return output

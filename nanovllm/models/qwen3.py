@@ -90,35 +90,27 @@ class Qwen3Attention(nn.Module):
         v = v.view(-1, self.num_kv_heads, self.head_dim)
         q, k = self.rotary_emb(positions, q, k)
 
-        # Check if attention replicas are available
+        # Use replicas for load balancing when available (including original attention as replica 0)
         replica_manager = get_attention_replica_manager()
-        if replica_manager and getattr(replica_manager, '_initialized', False):
-            print(f"DEBUG: Attention layer accessing replica manager {id(replica_manager)}, keys: {list(replica_manager.replicas.keys())}")
-            if "attention" in replica_manager.replicas:
-                replica = replica_manager.get_replica("attention")
-                if replica:
-                    # Use replica for attention computation
-                    print(f"DEBUG: Using attention replica on device {replica.device}")
-                    o, completion_event = replica.forward_async(q, k, v)
-                    # For now, wait for completion (async support can be added later)
-                    completion_event.synchronize()
-                    # Ensure output is back on the original device if needed
-                    if o.device != hidden_states.device:
-                        o = o.to(hidden_states.device, non_blocking=True)
-                    print(f"DEBUG: Replica attention completed, output shape: {o.shape}")
-                else:
-                    # Fallback to local attention
-                    print("DEBUG: No replica available, using local attention")
-                    o = self.attn(q, k, v)
+        if replica_manager and getattr(replica_manager, '_initialized', False) and len(replica_manager.replicas.get("attention", [])) > 0:
+            print(f"DEBUG: Attention layer using replicas")
+            # Use batch-level round-robin assignment for load balancing
+            replica = replica_manager.get_replica("attention")
+            if replica:
+                # Capture current context to pass to replica
+                from nanovllm.utils.context import get_context
+                current_context = get_context()
+
+                o, completion_event = replica.forward_async(q, k, v, context=current_context)
+                completion_event.synchronize()
+                if o.device != hidden_states.device:
+                    o = o.to(hidden_states.device, non_blocking=True)
+                print(f"DEBUG: Replica attention completed")
             else:
-                print(f"DEBUG: 'attention' not in replicas dict, using local attention")
+                print(f"DEBUG: No replica available, using local attention")
                 o = self.attn(q, k, v)
         else:
-            # No replica manager or not initialized, use local attention
-            if replica_manager:
-                print(f"DEBUG: Replicas configured but not ready yet (initialized: {getattr(replica_manager, '_initialized', False)}), using local attention during warmup")
-            else:
-                print(f"DEBUG: No replica manager configured, using local attention")
+            print(f"DEBUG: Using local attention (replicas not ready or not configured)")
             o = self.attn(q, k, v)
 
         output = self.o_proj(o.flatten(1, -1))
