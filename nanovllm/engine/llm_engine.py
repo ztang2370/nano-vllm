@@ -40,13 +40,17 @@ class LLMEngine:
         self.replica_manager = ReplicaManager(replica_config)
 
         # Set replica manager in the model for attention layers to use BEFORE creating ModelRunner
-        from nanovllm.models.qwen3 import set_attention_replica_manager
+        from nanovllm.models.qwen3 import set_attention_replica_manager, set_linear_replica_manager
         set_attention_replica_manager(self.replica_manager)
+        set_linear_replica_manager(self.replica_manager)
 
         self.model_runner = ModelRunner(config, 0, self.events)
 
         # Initialize attention replicas if configured (needs to happen after model is loaded)
         self._init_attention_replicas(config)
+
+        # Initialize linear replicas if configured (needs to happen after model is loaded)
+        self._init_linear_replicas(config)
 
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
@@ -60,6 +64,24 @@ class LLMEngine:
         attention_config = {}
         for name, module in self.model_runner.model.named_modules():
             if module.__class__.__name__ == 'Qwen3Attention':
+                # Store the Qwen3Attention instance for later use
+                attention_config = {
+                    'module': module,
+                    'num_heads': module.num_heads,
+                    'head_dim': module.head_dim,
+                    'scale': module.scaling,
+                    'num_kv_heads': module.num_kv_heads,
+                    'weights': dict(module.state_dict())
+                }
+                break
+        return attention_config
+
+    def _extract_attention_weights_for_layer(self, layer_id: int) -> dict:
+        """Extract attention configuration and weights for a specific layer."""
+        # Find the specific layer's attention module
+        attention_config = {}
+        for name, module in self.model_runner.model.named_modules():
+            if f'layers.{layer_id}.self_attn' in name and hasattr(module, 'attn'):
                 # Store the Qwen3Attention instance for later use
                 attention_config = {
                     'module': module,
@@ -90,25 +112,178 @@ class LLMEngine:
                 # beyond what's already in the Attention class
                 return {}
 
-            # Create replicas across configured devices
-            self.replica_manager.create_replicas(
-                op_name="attention",
-                op_class=self._get_attention_class(),
-                weights_cpu=attention_config,  # Pass full config including constructor params
-                devices=config.replica_devices,
-                workspace_factory=attention_workspace_factory,
-                num_replicas_per_device=num_replicas,
-            )
+            # Create replicas for each layer
+            num_layers = config.hf_config.num_hidden_layers
+            for layer_id in range(num_layers):
+                # Get attention configuration and weights for this specific layer
+                layer_attention_config = self._extract_attention_weights_for_layer(layer_id)
 
-            # Add the original attention as a special "replica 0"
-            # This allows the original attention operator to also be utilized for load balancing
-            original_attention_module = attention_config['module']
-            self.replica_manager.add_original_attention_replica("attention", original_attention_module)
+                if not layer_attention_config:
+                    logger.warning(f"Could not find Qwen3Attention module for layer {layer_id}")
+                    continue
+
+                # Create layer-specific replicas
+                op_name = f"attention_layer_{layer_id}"
+                self.replica_manager.create_replicas(
+                    op_name=op_name,
+                    op_class=self._get_attention_class(),
+                    weights_cpu=layer_attention_config,  # Pass full config including constructor params
+                    devices=config.replica_devices,
+                    workspace_factory=attention_workspace_factory,
+                    num_replicas_per_device=num_replicas,
+                )
+
+                # Add the original attention as a special "replica 0" for this layer
+                # Only when we actually have replicas configured
+                if num_replicas > 0:
+                    original_attention_module = layer_attention_config['module']
+                    self.replica_manager.add_original_attention_replica(op_name, original_attention_module)
+
+            logger.info(f"Created attention replicas for {num_layers} layers, {num_replicas} replicas per layer across {len(config.replica_devices)} devices")
+
+    def _init_linear_replicas(self, config: Config) -> None:
+        """Initialize linear operator replicas if configured."""
+        if "down_proj" in config.op_replica_configs:
+            num_replicas = config.op_replica_configs["down_proj"]
+
+            # Create replicas for each layer
+            num_layers = config.hf_config.num_hidden_layers
+            for layer_id in range(num_layers):
+                # Get down_proj configuration and weights for this specific layer
+                down_proj_config = self._extract_down_proj_weights_for_layer(layer_id)
+
+                if not down_proj_config:
+                    logger.warning(f"Could not find down_proj for layer {layer_id}")
+                    continue
+
+                # Create workspace factory for down_proj
+                def linear_workspace_factory(device):
+                    # Linear layers don't need extra workspace
+                    return {}
+
+                # Create layer-specific replicas
+                op_name = f"down_proj_layer_{layer_id}"
+                self.replica_manager.create_replicas(
+                    op_name=op_name,
+                    op_class=self._get_linear_class(),
+                    weights_cpu=down_proj_config,  # Pass full config including constructor params
+                    devices=config.replica_devices,
+                    workspace_factory=linear_workspace_factory,
+                    num_replicas_per_device=num_replicas,
+                )
+
+                # Add the original down_proj as a special "replica" so it can participate in load balancing
+                # Only when we actually have replicas configured
+                if num_replicas > 0:
+                    original_down_proj_module = down_proj_config['module']
+                    self.replica_manager.add_original_operator_replica(op_name, original_down_proj_module)
+
+                logger.info(f"Created {num_replicas} replicas for {op_name} across {len(config.replica_devices)} devices")
+
+            logger.info(f"Created down_proj replicas for {num_layers} layers, {num_replicas} replicas per layer across {len(config.replica_devices)} devices")
+
+    def _extract_down_proj_weights_for_layer(self, layer_id: int) -> dict:
+        """Extract down_proj configuration and weights for a specific layer."""
+        # Find the specific layer's down_proj module
+        linear_config = {}
+        for name, module in self.model_runner.model.named_modules():
+            if f'layers.{layer_id}.mlp' in name and hasattr(module, 'down_proj'):
+                # Store the RowParallelLinear instance for later use
+                down_proj_module = module.down_proj
+
+                # For RowParallelLinear: weight shape is (output_size, input_size // tp_size)
+                # Since RowParallelLinear shards the input dimension (tp_dim=1)
+                weight_shape = down_proj_module.weight.shape
+                original_output_size = weight_shape[0]
+                sharded_input_size = weight_shape[1]
+                original_input_size = sharded_input_size * down_proj_module.tp_size
+
+                linear_config = {
+                    'module': down_proj_module,
+                    'input_size': original_input_size,
+                    'output_size': original_output_size,
+                    'bias': down_proj_module.bias is not None,
+                    'tp_dim': down_proj_module.tp_dim,
+                    'weights': dict(down_proj_module.state_dict())
+                }
+                break
+        return linear_config
+
+    def _extract_activation_weights_for_layer(self, layer_id: int) -> dict:
+        """Extract activation function configuration for a specific layer."""
+        # Find the specific layer's activation function
+        act_config = {}
+        for name, module in self.model_runner.model.named_modules():
+            if f'layers.{layer_id}.mlp' in name and hasattr(module, 'act_fn'):
+                # Store the activation function instance
+                act_fn_module = module.act_fn
+                act_config = {
+                    'module': act_fn_module,
+                    'class_name': act_fn_module.__class__.__name__,
+                    # Activation functions are stateless, so no weights to extract
+                    'weights': {}
+                }
+                break
+        return act_config
+
+    def _extract_activation_weights(self) -> dict:
+        """Extract activation function configuration from the model for replication."""
+        # Find activation function in the model
+        act_config = {}
+        for name, module in self.model_runner.model.named_modules():
+            if hasattr(module, 'act_fn') and module.__class__.__name__ == 'Qwen3MLP':
+                # Store the activation function instance
+                act_fn_module = module.act_fn
+                act_config = {
+                    'module': act_fn_module,
+                    'class_name': act_fn_module.__class__.__name__,
+                    # Activation functions are stateless, so no weights to extract
+                    'weights': {}
+                }
+                break
+        return act_config
+
+    def _extract_down_proj_weights(self) -> dict:
+        """Extract down_proj configuration and weights from the model for replication."""
+        # Find down_proj layers in the model to extract config and weights
+        linear_config = {}
+        for name, module in self.model_runner.model.named_modules():
+            if hasattr(module, 'down_proj') and module.__class__.__name__ == 'Qwen3MLP':
+                # Store the RowParallelLinear instance for later use
+                down_proj_module = module.down_proj
+
+                # For RowParallelLinear: weight shape is (output_size, input_size // tp_size)
+                # Since RowParallelLinear shards the input dimension (tp_dim=1)
+                weight_shape = down_proj_module.weight.shape
+                original_output_size = weight_shape[0]
+                sharded_input_size = weight_shape[1]
+                original_input_size = sharded_input_size * down_proj_module.tp_size
+
+                linear_config = {
+                    'module': down_proj_module,
+                    'input_size': original_input_size,
+                    'output_size': original_output_size,
+                    'bias': down_proj_module.bias is not None,
+                    'tp_dim': down_proj_module.tp_dim,
+                    'weights': dict(down_proj_module.state_dict())
+                }
+                break
+        return linear_config
 
     def _get_attention_class(self):
         """Get the Attention class for replication."""
         from nanovllm.layers.attention import Attention
         return Attention
+
+    def _get_activation_class(self):
+        """Get the ReplicaSiluAndMul class for replication."""
+        from nanovllm.layers.activation import ReplicaSiluAndMul
+        return ReplicaSiluAndMul
+
+    def _get_linear_class(self):
+        """Get the RowParallelLinear class for replication."""
+        from nanovllm.layers.linear import RowParallelLinear
+        return RowParallelLinear
 
     def exit(self):
         # Shutdown replica manager first

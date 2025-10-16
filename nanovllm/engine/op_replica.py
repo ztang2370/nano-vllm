@@ -72,7 +72,7 @@ class OperatorReplica:
         torch.cuda.set_device(self.device)
         self.stream = torch.cuda.Stream(device=self.device)
 
-        # Handle different weight formats
+        # Handle different weight formats and operator types
         if isinstance(weights_cpu, dict) and 'weights' in weights_cpu:
             # New format with config and weights
             config = weights_cpu
@@ -80,12 +80,7 @@ class OperatorReplica:
             for name, weight in config['weights'].items():
                 self.weights[name] = weight.to(self.device)
             # Store config for operator construction
-            self.op_config = {
-                'num_heads': config['num_heads'],
-                'head_dim': config['head_dim'],
-                'scale': config['scale'],
-                'num_kv_heads': config['num_kv_heads']
-            }
+            self.op_config = {k: v for k, v in config.items() if k != 'weights' and k != 'module'}
         else:
             # Legacy format - just weights dict
             self.weights = {}
@@ -96,8 +91,8 @@ class OperatorReplica:
         # Create workspace if factory provided
         self.workspace = workspace_factory(self.device) if workspace_factory else {}
 
-        # Use the original Attention class which now has replica support
-        if self.op_config:
+        # Create the appropriate operator based on the class
+        if str(self.op_class.__name__) == 'Attention':
             # Extract attention parameters
             num_heads = self.op_config.get('num_heads', 16)
             head_dim = self.op_config.get('head_dim', 128)
@@ -109,18 +104,49 @@ class OperatorReplica:
 
             # Create Attention instance - it will detect replica mode automatically
             self.op = Attention(num_heads, head_dim, scale, num_kv_heads, weights=self.weights)
+        elif str(self.op_class.__name__) == 'RowParallelLinear':
+            # Extract linear parameters
+            input_size = self.op_config.get('input_size', 1024)
+            output_size = self.op_config.get('output_size', 1024)
+            bias = self.op_config.get('bias', False)
+            tp_dim = self.op_config.get('tp_dim', 1)
+
+            # Import here to avoid circular imports
+            from nanovllm.layers.linear import RowParallelLinear
+
+            # Create RowParallelLinear instance
+            self.op = RowParallelLinear(input_size, output_size, bias=bias)
+            # Load the weights by directly assigning them and converting dtype
+            with torch.no_grad():
+                for name, param in self.op.named_parameters():
+                    if name in self.weights:
+                        # Copy the weight data and convert to the weight's dtype
+                        param.data = self.weights[name].clone()
+            # Ensure the operator is on the correct device
+            self.op = self.op.to(self.device)
+        elif str(self.op_class.__name__) == 'ReplicaSiluAndMul':
+            # Import here to avoid circular imports
+            from nanovllm.layers.activation import ReplicaSiluAndMul
+
+            # Create ReplicaSiluAndMul instance (stateless, no parameters)
+            self.op = ReplicaSiluAndMul()
+            # Move to device
+            self.op = self.op.to(self.device)
         else:
             # Fallback dummy operator
             class DummyOp:
-                def forward(self, q, k, v):
-                    return q
+                def forward(self, *args, **kwargs):
+                    return args[0] if args else None
             self.op = DummyOp()
+
+        # Create dedicated CUDA stream for this replica to enable true parallelism
+        self.stream = torch.cuda.Stream(self.device)
 
         # Metrics and state
         self.metrics = ReplicaMetrics()
         self._lock = threading.Lock()
 
-        logger.info(f"Created operator replica on device {self.device}")
+        logger.info(f"Created operator replica on device {self.device} with dedicated stream")
 
     def forward_async(
         self,
@@ -138,7 +164,6 @@ class OperatorReplica:
         Returns:
             Tuple of (output_tensor, completion_event)
         """
-        print(f"DEBUG: Additional replica forward_async called")
         with self._lock:
             self.metrics.in_flight_count += 1
             self.metrics.busy = True
@@ -171,13 +196,13 @@ class OperatorReplica:
                     context_dict[key] = value.to(self.device)
             set_context(**context_dict)
 
-        # Execute on default stream for now (streams may cause issues with flash_attn)
-        # TODO: Fix stream synchronization for flash_attn compatibility
-        output = self.op.forward(*args_device, **kwargs)
+        # Execute on dedicated replica stream for true parallelism
+        with torch.cuda.stream(self.stream):
+            output = self.op.forward(*args_device, **kwargs)
 
-        # Record completion event on default stream
+        # Record completion event on replica stream
         completion_event = torch.cuda.Event()
-        completion_event.record()
+        completion_event.record(self.stream)
 
         # Schedule callback to update metrics when done
         def _update_metrics():
@@ -249,7 +274,6 @@ class ReplicaManager:
         num_per_device = num_replicas_per_device or self.config.num_replicas_per_device
 
         with self._lock:
-            print(f"DEBUG: Creating replicas for {op_name}, devices: {devices}, num_per_device: {num_per_device}")
             self.replicas[op_name] = []
             self._round_robin_idx[op_name] = 0
 
@@ -263,7 +287,6 @@ class ReplicaManager:
                             workspace_factory=workspace_factory,
                         )
                         self.replicas[op_name].append(replica)
-                        print(f"DEBUG: Created {op_name} replica {replica_idx} on device {device_idx}")
                         logger.info(f"Created {op_name} replica {replica_idx} on device {device_idx}")
                     except Exception as e:
                         logger.error(f"Failed to create {op_name} replica on device {device_idx}: {e}")
@@ -271,35 +294,80 @@ class ReplicaManager:
 
             self._initialized = True
 
-    def get_replica(self, op_name: str) -> Optional[OperatorReplica]:
+    def get_replicas_for_batch_split(self, op_name: str, layer_id: Optional[int] = None, batch_size: int = 1) -> List[OperatorReplica]:
+        """
+        Get all available replicas for batch splitting - distribute batch across all replicas.
+
+        Args:
+            op_name: Name of the operator
+            layer_id: Optional layer ID for layer-specific replicas
+            batch_size: Size of the batch to split
+
+        Returns:
+            List of replicas to use for parallel processing, or empty list if none available
+        """
+        # Try layer-specific replica first, then fall back to general replica
+        candidate_names = []
+        if layer_id is not None:
+            candidate_names.append(f"{op_name}_layer_{layer_id}")
+        candidate_names.append(op_name)
+
+        selected_op_name = None
+        replicas = None
+        for candidate in candidate_names:
+            if candidate in self.replicas and self.replicas[candidate]:
+                selected_op_name = candidate
+                replicas = self.replicas[candidate]
+                break
+
+        if not replicas:
+            return []
+
+        # For batch splitting, use all available replicas
+        print(f"BATCH_SPLIT: Splitting batch of size {batch_size} across {len(replicas)} {selected_op_name} replicas")
+        return replicas
+
+    def get_replica(self, op_name: str, layer_id: Optional[int] = None) -> Optional[OperatorReplica]:
         """
         Get an available replica for the operator using round-robin assignment.
 
         Args:
             op_name: Name of the operator
+            layer_id: Optional layer ID for layer-specific replicas
 
         Returns:
             An available replica, or None if no replicas exist
         """
-        # Note: We don't use the lock here to avoid contention during inference
-        # The replicas dict should be stable after initialization
-        if op_name not in self.replicas or not self.replicas[op_name]:
+        # Try layer-specific replica first, then fall back to general replica
+        candidate_names = []
+        if layer_id is not None:
+            candidate_names.append(f"{op_name}_layer_{layer_id}")
+        candidate_names.append(op_name)
+
+        selected_op_name = None
+        replicas = None
+        for candidate in candidate_names:
+            if candidate in self.replicas and self.replicas[candidate]:
+                selected_op_name = candidate
+                replicas = self.replicas[candidate]
+                break
+
+        if not replicas:
             return None
 
-        # Check if we already selected a replica for this batch
-        if op_name in self._batch_replica:
-            return self._batch_replica[op_name]
-
-        replicas = self.replicas[op_name]
+        # Check if we already selected a replica for this batch and layer
+        batch_key = f"{selected_op_name}_layer_{layer_id}" if layer_id is not None else selected_op_name
+        if batch_key in self._batch_replica:
+            return self._batch_replica[batch_key]
 
         # Use round-robin assignment for load balancing across batches
-        idx = self._round_robin_idx[op_name]
-        self._round_robin_idx[op_name] = (idx + 1) % len(replicas)
+        idx = self._round_robin_idx[selected_op_name]
+        self._round_robin_idx[selected_op_name] = (idx + 1) % len(replicas)
 
         replica = replicas[idx]
         # Cache this replica for the current batch
-        self._batch_replica[op_name] = replica
-        print(f"BATCH_ASSIGN: Batch -> attention replica {idx}")
+        self._batch_replica[batch_key] = replica
+        print(f"BATCH_ASSIGN: Batch -> {selected_op_name} replica {idx}")
         return replica
 
     def clear_batch_replicas(self):
@@ -415,7 +483,6 @@ class ReplicaManager:
 
                 def forward_async(self, q, k, v, context=None):
                     """Execute attention computation with proper KV cache management."""
-                    print(f"DEBUG: Replica 0 forward_async called, q.shape={q.shape}")
                     with self._lock:
                         self.metrics.in_flight_count += 1
                         self.metrics.busy = True
@@ -430,9 +497,7 @@ class ReplicaManager:
                             set_context(**context_dict)
 
                         # Call the original attention method directly (it will use the shared KV cache)
-                        print(f"DEBUG: Replica 0 calling original attention")
                         o = self.original_module.attn(q, k, v)
-                        print(f"DEBUG: Replica 0 attention completed, o.shape={o.shape}")
 
                         # Create event for synchronization
                         event = torch.cuda.Event()
@@ -456,6 +521,58 @@ class ReplicaManager:
             self.replicas[op_name].insert(0, original_replica)
             print(f"DEBUG: Added original attention as replica 0 for {op_name}")
             logger.info(f"Added original attention as replica 0 for {op_name}")
+
+    def add_original_operator_replica(self, op_name: str, original_module) -> None:
+        """
+        Add the original operator module as a special "replica" so it can be utilized
+        for load balancing during bursty requests. For stateless operators like linear layers.
+
+        Args:
+            op_name: Name of the operator
+            original_module: The original operator module instance
+        """
+        with self._lock:
+            if op_name not in self.replicas:
+                logger.warning(f"No replicas exist for {op_name}, cannot add original operator replica")
+                return
+
+            # Create a simple wrapper for the original stateless operator
+            class OriginalOperatorReplica:
+                def __init__(self, original_module):
+                    self.device = original_module.weight.device if hasattr(original_module, 'weight') else torch.device('cuda:0')
+                    self.original_module = original_module
+                    self.metrics = ReplicaMetrics()
+                    self._lock = threading.Lock()
+                    # Create dedicated CUDA stream for this replica to enable true parallelism
+                    self.stream = torch.cuda.Stream(self.device)
+
+                def forward_async(self, *args, **kwargs):
+                    """Execute the original operator."""
+                    with self._lock:
+                        self.metrics.in_flight_count += 1
+                        self.metrics.busy = True
+
+                        # Execute on dedicated replica stream for true parallelism
+                        with torch.cuda.stream(self.stream):
+                            output = self.original_module(*args, **kwargs)
+
+                        # Create event for synchronization on replica stream
+                        event = torch.cuda.Event()
+                        event.record(self.stream)
+
+                        self.metrics.in_flight_count -= 1
+                        self.metrics.busy = False
+
+                        return output, event
+
+                def synchronize(self):
+                    """Synchronize the operator's stream."""
+                    torch.cuda.synchronize(self.device)
+
+            # Add the original operator replica to the pool
+            original_replica = OriginalOperatorReplica(original_module)
+            self.replicas[op_name].append(original_replica)
+            logger.info(f"Added original operator module as replica for {op_name}")
 
     def get_metrics(self, op_name: str) -> List[ReplicaMetrics]:
         """Get metrics for all replicas of an operator."""

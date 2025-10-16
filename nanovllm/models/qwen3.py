@@ -10,8 +10,9 @@ from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
-# Global replica manager reference (set by LLMEngine)
+# Global replica manager references (set by LLMEngine)
 _attention_replica_manager = None
+_linear_replica_manager = None
 
 def set_attention_replica_manager(manager):
     """Set the global attention replica manager."""
@@ -21,6 +22,15 @@ def set_attention_replica_manager(manager):
 def get_attention_replica_manager():
     """Get the global attention replica manager."""
     return _attention_replica_manager
+
+def set_linear_replica_manager(manager):
+    """Set the global linear replica manager."""
+    global _linear_replica_manager
+    _linear_replica_manager = manager
+
+def get_linear_replica_manager():
+    """Get the global linear replica manager."""
+    return _linear_replica_manager
 
 
 class Qwen3Attention(nn.Module):
@@ -92,10 +102,9 @@ class Qwen3Attention(nn.Module):
 
         # Use replicas for load balancing when available (including original attention as replica 0)
         replica_manager = get_attention_replica_manager()
-        if replica_manager and getattr(replica_manager, '_initialized', False) and len(replica_manager.replicas.get("attention", [])) > 0:
-            print(f"DEBUG: Attention layer using replicas")
+        if replica_manager and getattr(replica_manager, '_initialized', False):
             # Use batch-level round-robin assignment for load balancing
-            replica = replica_manager.get_replica("attention")
+            replica = replica_manager.get_replica("attention", layer_id=getattr(self, 'layer_id', None))
             if replica:
                 # Capture current context to pass to replica
                 from nanovllm.utils.context import get_context
@@ -105,12 +114,9 @@ class Qwen3Attention(nn.Module):
                 completion_event.synchronize()
                 if o.device != hidden_states.device:
                     o = o.to(hidden_states.device, non_blocking=True)
-                print(f"DEBUG: Replica attention completed")
             else:
-                print(f"DEBUG: No replica available, using local attention")
                 o = self.attn(q, k, v)
         else:
-            print(f"DEBUG: Using local attention (replicas not ready or not configured)")
             o = self.attn(q, k, v)
 
         output = self.o_proj(o.flatten(1, -1))
@@ -142,7 +148,66 @@ class Qwen3MLP(nn.Module):
     def forward(self, x):
         gate_up = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x = self.down_proj(x)
+
+        # Use replicas for batch-parallel processing when available
+        replica_manager = get_linear_replica_manager()
+        if replica_manager and getattr(replica_manager, '_initialized', False):
+            # Try batch splitting across all available replicas
+            layer_id = getattr(self, 'layer_id', None)
+            replicas = replica_manager.get_replicas_for_batch_split("down_proj", layer_id=layer_id, batch_size=x.shape[0])
+
+            if replicas and len(replicas) > 1 and x.shape[0] >= len(replicas):
+                # Split batch across replicas for parallel processing
+                batch_size = x.shape[0]
+                num_replicas = len(replicas)
+                split_size = batch_size // num_replicas
+                remainder = batch_size % num_replicas
+
+                results = []
+                events = []
+
+                # Distribute batch across replicas
+                start_idx = 0
+                for i, replica in enumerate(replicas):
+                    # Calculate split size for this replica (handle remainder)
+                    current_split = split_size + (1 if i < remainder else 0)
+                    if current_split == 0:
+                        continue
+
+                    end_idx = start_idx + current_split
+                    x_split = x[start_idx:end_idx]
+
+                    # Execute replica asynchronously
+                    result, event = replica.forward_async(x_split)
+                    results.append(result)
+                    events.append(event)
+                    start_idx = end_idx
+
+                # Wait for all replicas to complete
+                for event in events:
+                    event.synchronize()
+
+                # Concatenate results back together
+                x = torch.cat(results, dim=0)
+
+                # Ensure result is on correct device
+                if x.device != gate_up.device:
+                    x = x.to(gate_up.device, non_blocking=True)
+
+                print(f"DEBUG: Batch-split down_proj completed: {len(replicas)} replicas, batch_size {batch_size}")
+            else:
+                # Fall back to single replica processing
+                replica = replica_manager.get_replica("down_proj", layer_id=layer_id)
+                if replica:
+                    x, completion_event = replica.forward_async(x)
+                    completion_event.synchronize()
+                    if x.device != gate_up.device:
+                        x = x.to(gate_up.device, non_blocking=True)
+                else:
+                    x = self.down_proj(x)
+        else:
+            x = self.down_proj(x)
+
         return x
 
 
@@ -151,8 +216,10 @@ class Qwen3DecoderLayer(nn.Module):
     def __init__(
         self,
         config: Qwen3Config,
+        layer_id: int = 0,
     ) -> None:
         super().__init__()
+        self.layer_id = layer_id
         self.self_attn = Qwen3Attention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
@@ -164,11 +231,17 @@ class Qwen3DecoderLayer(nn.Module):
             rope_theta=getattr(config, "rope_theta", 1000000),
             rope_scaling=getattr(config, "rope_scaling", None),
         )
+        # Set layer_id on attention module
+        self.self_attn.layer_id = layer_id
+
         self.mlp = Qwen3MLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
         )
+        # Set layer_id on MLP module
+        self.mlp.layer_id = layer_id
+
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -196,7 +269,7 @@ class Qwen3Model(nn.Module):
     ) -> None:
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList([Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList([Qwen3DecoderLayer(config, layer_id=i) for i in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
