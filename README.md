@@ -17,6 +17,7 @@ pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
 ## Manual Download
 
 If you prefer to download the model weights manually, use the following command:
+
 ```bash
 huggingface-cli download --resume-download Qwen/Qwen3-0.6B \
   --local-dir ~/huggingface/Qwen3-0.6B/ \
@@ -26,6 +27,7 @@ huggingface-cli download --resume-download Qwen/Qwen3-0.6B \
 ## Quick Start
 
 See `example.py` for usage. The API mirrors vLLM's interface with minor differences in the `LLM.generate` method:
+
 ```python
 from nanovllm import LLM, SamplingParams
 llm = LLM("/YOUR/MODEL/PATH", enforce_eager=True, tensor_parallel_size=1)
@@ -40,18 +42,17 @@ outputs[0]["text"]
 See `bench.py` for benchmark.
 
 **Test Configuration:**
-- Hardware: RTX 4070 Laptop (8GB)
-- Model: Qwen3-0.6B
-- Total Requests: 256 sequences
-- Input Length: Randomly sampled between 100–1024 tokens
-- Output Length: Randomly sampled between 100–1024 tokens
+* Hardware: RTX 4070 Laptop (8GB)
+* Model: Qwen3-0.6B
+* Total Requests: 256 sequences
+* Input Length: Randomly sampled between 100–1024 tokens
+* Output Length: Randomly sampled between 100–1024 tokens
 
 **Performance Results:**
 | Inference Engine | Output Tokens | Time (s) | Throughput (tokens/s) |
 |----------------|-------------|----------|-----------------------|
 | vLLM           | 133,966     | 98.37    | 1361.84               |
 | Nano-vLLM      | 133,966     | 93.41    | 1434.13               |
-
 
 ## Star History
 

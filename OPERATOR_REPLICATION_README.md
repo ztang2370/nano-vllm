@@ -1,58 +1,52 @@
 # Operator-Level Replication in nano-vLLM
 
-This document describes the operator-level replication feature implemented for nano-vLLM, which allows multiple replicas of inference operators (currently Attention) to run on different GPUs to handle bursty workloads.
+This document describes the operator-level replication feature implemented for nano-vLLM, which provides a framework for parallel processing of stateless operators (currently `down_proj` linear layers) across multiple GPUs, though currently limited by CUDA stream synchronization issues.
 
 ## Overview
 
 The operator replication system provides:
 
-- **Multiple operator replicas** across GPUs with dedicated CUDA streams
-- **Load balancing** with round-robin scheduling
-- **Asynchronous execution** with CUDA streams and events
-- **Auto-scaling** based on queue length and utilization
-- **Metrics and logging** for monitoring performance
+- **Multiple operator replicas** across GPUs (currently serial execution due to stream issues)
+- **Batch splitting** framework for potential parallel processing
+- **Per-layer replication** to handle model-specific weight configurations
+- **Load balancing** with original operators integrated into replica pools
 
 ## Architecture
 
 ### Core Components
 
 1. **`OperatorReplica`**: Represents a single replica of an operator on a specific GPU
-   - Maintains duplicated weights and workspace
-   - Uses a dedicated CUDA stream for execution
-   - Tracks metrics (latency, utilization, request count)
+   - Maintains duplicated weights and configuration
+   - Uses a dedicated CUDA stream for asynchronous execution
+   - Tracks metrics for monitoring and debugging
 
-2. **`ReplicaManager`**: Manages a pool of operator replicas
+2. **`OriginalOperatorReplica`**: Wrapper for original model operators
+   - Allows original operators to participate in load balancing
+   - Maintains the same interface as replicated operators
+
+3. **`ReplicaManager`**: Manages a pool of operator replicas
    - Creates and destroys replicas across devices
-   - Provides load balancing (round-robin scheduling)
+   - Provides batch splitting for parallel processing
+   - Integrates original operators into replica pools
    - Handles lifecycle management and cleanup
-
-3. **`ReplicaAutoScaler`**: Background thread for dynamic scaling
-   - Monitors queue lengths and GPU utilization
-   - Adds/removes replicas based on load thresholds
-   - Configurable scaling parameters
 
 ### Files Modified/Added
 
 - `nanovllm/engine/op_replica.py` - Core replica implementation
 - `nanovllm/config.py` - Configuration options
-- `nanovllm/engine/llm_engine.py` - Integration with inference engine
-- `nanovllm/models/qwen3.py` - Attention layer integration
-- `bench/op_replica_burst_test.py` - Stress testing script
-- `nanovllm/tests/test_op_replica.py` - Unit tests
+- `nanovllm/engine/llm_engine.py` - Integration with inference engine and replica initialization
+- `nanovllm/models/qwen3.py` - MLP layer integration with batch splitting
 
 ## Configuration
 
 ### CLI Options
 
 ```bash
-# Enable attention replicas (2 per GPU, auto-detect GPUs)
---op-replica attention:2
+# Enable down_proj replicas (2 per GPU, auto-detect GPUs)
+--op-replica down_proj:2
 
-# Specify GPU devices for replicas
+# Specify GPU devices for replicas (optional, auto-detects if not specified)
 --replica-devices 0,1,2
-
-# Enable auto-scaling
---enable-op-replica-auto-scaling
 ```
 
 ### Programmatic Configuration
@@ -62,9 +56,8 @@ from nanovllm import LLM
 
 llm = LLM(
     model="path/to/model",
-    op_replica_configs={"attention": 2},  # 2 replicas per GPU
-    replica_devices=[0, 1],               # Use GPUs 0 and 1
-    enable_op_replica_auto_scaling=True,
+    op_replica_configs={"down_proj": 2},  # 2 replicas per GPU per layer
+    replica_devices=[0, 1],               # Use GPUs 0 and 1 (optional)
 )
 ```
 
@@ -75,148 +68,71 @@ llm = LLM(
 ```python
 from nanovllm import LLM, SamplingParams
 
-# Initialize LLM with attention replicas
+# Initialize LLM with down_proj replicas
 llm = LLM(
     model="path/to/model",
-    op_replica_configs={"attention": 2},  # 2 attention replicas per GPU
-    replica_devices=[0, 1],               # Use GPUs 0 and 1
+    op_replica_configs={"down_proj": 2},  # 2 down_proj replicas per GPU per layer
+    replica_devices=[0, 1],               # Use GPUs 0 and 1 (optional)
 )
 
-# Generate as usual - replicas are used automatically
+# Generate as usual - batch splitting happens automatically during inference
 outputs = llm.generate(prompts, sampling_params)
-```
-
-### Stress Testing
-
-```bash
-# Run burst test to compare performance with/without replicas
-python bench/op_replica_burst_test.py --model path/to/model --output results.json
-
-# Quick test
-python bench/op_replica_burst_test.py --model path/to/model --quick
-```
-
-### Unit Testing
-
-```bash
-python -m pytest nanovllm/tests/test_op_replica.py -v
 ```
 
 ## Performance Characteristics
 
 ### Benefits
 
-- **Reduced tail latency** during bursty workloads
-- **Better GPU utilization** by distributing load across devices
-- **Scalable throughput** as more GPUs are added
+- **Framework for parallel processing** (not currently achieved due to stream issues)
+- **Load distribution framework** across multiple GPUs
+- **Per-layer specialization** ensuring correct weights for each model layer
+- **Scalable architecture** ready for parallel execution once stream issues resolved
 
 ### Trade-offs
 
-- **Memory overhead** from weight duplication (first iteration)
-- **Initialization time** for creating replicas
-- **Complexity** in synchronization and stream management
+- **Memory overhead** from weight duplication across GPUs
+- **Initialization time** for creating and loading replicas
+- **Coordination overhead** for batch splitting and result aggregation
+- **Limited to stateless operators currently** (linear layers, not attention)
 
 ## Implementation Details
 
-### Weight Duplication
+### Per-Layer Replication
 
-Currently, weights are duplicated to each GPU replica. Future optimizations may include:
-- CUDA IPC for sharing read-only weights
-- NCCL broadcast for efficient weight distribution
+Each model layer gets its own set of replicas with the correct weights:
+- `down_proj_layer_0`, `down_proj_layer_1`, etc.
+- Ensures each layer uses its specific weight configuration
+- Original operators integrated into replica pools for load balancing
+
+### Batch Splitting
+
+Input batches are automatically split across available replicas:
+- **Current Issue**: Serial execution on default stream, not simultaneous across GPUs
+- Framework in place for parallel execution once stream issues are resolved
+- Aggregates results back into correct order
+- Balances load when batch size ≥ number of replicas
 
 ### Synchronization
 
-- Uses CUDA streams for asynchronous execution
-- CUDA events for synchronization between operations
-- Automatic device transfer with `non_blocking=True`
-
-### Load Balancing
-
-- Round-robin scheduling across available replicas
-- Future enhancements may include load-aware scheduling
-
-### Auto-scaling
-
-- Monitors queue length and replica utilization
-- Adds replicas when queue length > 10 and utilization > 80%
-- Removes idle replicas after 30 seconds
+- **Current Limitation**: Dedicated CUDA streams cause garbled output, so replicas currently use the default stream
+- **Impact**: No true parallelism achieved - replicas execute serially despite multiple GPUs
+- CUDA events for coordination between operations
+- Thread-safe metrics tracking with proper locking
 
 ## Limitations & Future Work
 
 ### Current Limitations
 
-1. **Single operator type**: Only Attention operator replication implemented
-2. **Weight duplication**: No memory sharing between replicas
-3. **Single machine**: No cross-host replication
-4. **Synchronous waits**: Some operations still wait for completion
+1. **🚨 No True Parallelism**: Dedicated CUDA streams cause garbled output, forcing serial execution on default stream
+2. **Single operator type**: Only `down_proj` (MLP linear layer) replication implemented
+3. **Stateless operators only**: Cannot replicate stateful operators like attention
 
 ### Future Enhancements
 
-1. **Multi-operator support**: Extend to MLP, embedding layers
-2. **Memory optimization**: CUDA IPC, memory pooling
-3. **Cross-host replication**: RPC-based remote replicas
-4. **Advanced scheduling**: Load-aware, priority-based scheduling
-5. **Async pipeline**: Full asynchronous execution pipeline
+1. **🚨 Fix Stream Parallelism**: Resolve CUDA stream issues to enable true parallel execution
+2. **Multi-operator support**: Extend to other linear layers (gate_proj, up_proj)
+3. **Advanced scheduling**: Load-aware balancing, priority-based routing
+4. **Cross-host replication**: Distributed replica pools across machines
+5. **Activation function replication**: Support for stateless activation layers
 
-## Testing
-
-### Correctness Tests
-
-The implementation includes comprehensive unit tests covering:
-- Replica creation and lifecycle
-- Asynchronous execution
-- Load balancing
-- Auto-scaling logic
-- Deadlock prevention
-
-### Performance Tests
-
-The burst test script measures:
-- Throughput improvement with replicas
-- Latency reduction under load
-- Scalability across multiple GPUs
-
-## Troubleshooting
-
-### Common Issues
-
-1. **CUDA out of memory**: Reduce `num_replicas_per_device`
-2. **Slow initialization**: Expected due to weight duplication
-3. **No performance gain**: Check if workload is compute-bound
-
-### Debugging
-
-Enable logging to see replica operations:
-```python
-import logging
-logging.basicConfig(level=logging.INFO)
-```
-
-Metrics are available through `ReplicaManager.get_metrics(op_name)`.
-
-## API Reference
-
-### ReplicaManager
-
-```python
-class ReplicaManager:
-    def create_replicas(self, op_name, op_class, weights_cpu, devices, workspace_factory=None, num_replicas_per_device=1)
-    def get_replica(self, op_name) -> OperatorReplica
-    def add_replica(self, op_name, device) -> bool
-    def remove_idle_replica(self, op_name) -> bool
-    def get_metrics(self, op_name) -> List[ReplicaMetrics]
-    def shutdown()
-```
-
-### OperatorReplica
-
-```python
-class OperatorReplica:
-    def forward_async(self, *args, **kwargs) -> Tuple[torch.Tensor, torch.cuda.Event]
-    def synchronize()
-    def is_idle(self, timeout_ms=5000) -> bool
-```
-
-This implementation provides a solid foundation for operator-level replication in nano-vLLM, with room for future optimizations and extensions.
-
-
+This implementation provides a foundation for stateless operator replication in nano-vLLM, with batch splitting and per-layer weight management in place, but currently limited by CUDA stream issues that prevent true parallel execution.

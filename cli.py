@@ -5,7 +5,6 @@ CLI interface for nano-vLLM with operator replication support.
 
 import argparse
 import sys
-from pathlib import Path
 
 from nanovllm import LLM, SamplingParams
 from nanovllm.config import Config
@@ -64,14 +63,12 @@ def main():
         'num_kvcache_blocks': config.num_kvcache_blocks,
         'op_replica_configs': config.op_replica_configs,
         'replica_devices': config.replica_devices,
-        'enable_op_replica_auto_scaling': getattr(args, 'enable_op_replica_auto_scaling', False),
     }
 
     print("nano-vLLM CLI")
     print(f"Model: {args.model}")
     print(f"Op Replica Config: {config.op_replica_configs}")
     print(f"Replica Devices: {config.replica_devices}")
-    print(f"Auto-scaling: {getattr(args, 'enable_op_replica_auto_scaling', False)}")
     print("-" * 50)
 
     try:

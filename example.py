@@ -1,11 +1,12 @@
 import os
-from nanovllm import LLM, SamplingParams
+
 from transformers import AutoTokenizer
+
+from nanovllm import LLM, SamplingParams
 
 
 def main():
     model = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
-    # model = "Qwen/Qwen3-0.6B"
     tokenizer = AutoTokenizer.from_pretrained(model)
     llm = LLM(model, enforce_eager=True, tensor_parallel_size=1)
 

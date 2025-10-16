@@ -3,12 +3,15 @@
 Benchmark script to measure batch splitting performance improvement
 """
 
-import torch
-import time
+import os
 import subprocess
 import sys
-import os
+import time
+
+import torch
+
 from nanovllm import LLM
+
 
 def test_parallelism():
     """Test to verify if replicas truly process in parallel by comparing single vs parallel"""
@@ -32,19 +35,18 @@ def test_parallelism():
 
     result_single = subprocess.run(cmd_single, capture_output=True, text=True, cwd=os.getcwd())
     if result_single.returncode != 0:
-        print(f"ERROR: Single replica test failed")
+        print("ERROR: Single replica test failed")
         print(f"STDOUT: {result_single.stdout}")
         print(f"STDERR: {result_single.stderr}")
         return None
 
     # Parse result
-    time_single = throughput_single = None
+    time_single = None
     for line in result_single.stdout.split('\n'):
         if line.startswith('RESULT_SINGLE:'):
             parts = line.split(':')
             if len(parts) >= 3:
                 time_single = float(parts[1])
-                throughput_single = float(parts[2])
                 break
 
     if time_single is None:
@@ -68,19 +70,18 @@ def test_parallelism():
 
     result_parallel = subprocess.run(cmd_parallel, capture_output=True, text=True, cwd=os.getcwd())
     if result_parallel.returncode != 0:
-        print(f"ERROR: Parallel replica test failed")
+        print("ERROR: Parallel replica test failed")
         print(f"STDOUT: {result_parallel.stdout}")
         print(f"STDERR: {result_parallel.stderr}")
         return None
 
     # Parse result
-    time_parallel = throughput_parallel = None
+    time_parallel = None
     for line in result_parallel.stdout.split('\n'):
         if line.startswith('RESULT_PARALLEL:'):
             parts = line.split(':')
             if len(parts) >= 3:
                 time_parallel = float(parts[1])
-                throughput_parallel = float(parts[2])
                 break
 
     if time_parallel is None:
@@ -143,7 +144,7 @@ def benchmark_single_config(config_name, replicas, batch_size):
         start_time = time.time()
 
         mlp = model.layers[0].mlp
-        output = mlp(test_input)
+        _ = mlp(test_input)
 
         torch.cuda.synchronize()  # Wait for GPU completion
         end_time = time.time()
@@ -297,7 +298,7 @@ def run_single_test(test_type, replicas, batch_size):
 
     start_event.record()
     mlp = model.layers[0].mlp
-    output = mlp(test_input)
+    _ = mlp(test_input)
     end_event.record()
     torch.cuda.synchronize()
 

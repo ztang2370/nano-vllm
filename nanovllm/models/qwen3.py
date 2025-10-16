@@ -1,27 +1,18 @@
 import torch
-from torch import nn
 import torch.distributed as dist
+from torch import nn
 from transformers import Qwen3Config
 
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.attention import Attention
+from nanovllm.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
 from nanovllm.layers.layernorm import RMSNorm
-from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
+from nanovllm.layers.linear import (MergedColumnParallelLinear,
+                                    QKVParallelLinear, RowParallelLinear)
 from nanovllm.layers.rotary_embedding import get_rope
-from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
 # Global replica manager references (set by LLMEngine)
-_attention_replica_manager = None
 _linear_replica_manager = None
-
-def set_attention_replica_manager(manager):
-    """Set the global attention replica manager."""
-    global _attention_replica_manager
-    _attention_replica_manager = manager
-
-def get_attention_replica_manager():
-    """Get the global attention replica manager."""
-    return _attention_replica_manager
 
 def set_linear_replica_manager(manager):
     """Set the global linear replica manager."""
@@ -99,26 +90,7 @@ class Qwen3Attention(nn.Module):
         k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim))
         v = v.view(-1, self.num_kv_heads, self.head_dim)
         q, k = self.rotary_emb(positions, q, k)
-
-        # Use replicas for load balancing when available (including original attention as replica 0)
-        replica_manager = get_attention_replica_manager()
-        if replica_manager and getattr(replica_manager, '_initialized', False):
-            # Use batch-level round-robin assignment for load balancing
-            replica = replica_manager.get_replica("attention", layer_id=getattr(self, 'layer_id', None))
-            if replica:
-                # Capture current context to pass to replica
-                from nanovllm.utils.context import get_context
-                current_context = get_context()
-
-                o, completion_event = replica.forward_async(q, k, v, context=current_context)
-                completion_event.synchronize()
-                if o.device != hidden_states.device:
-                    o = o.to(hidden_states.device, non_blocking=True)
-            else:
-                o = self.attn(q, k, v)
-        else:
-            o = self.attn(q, k, v)
-
+        o = self.attn(q, k, v)
         output = self.o_proj(o.flatten(1, -1))
         return output
 
@@ -149,7 +121,6 @@ class Qwen3MLP(nn.Module):
         gate_up = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
 
-        # Use replicas for batch-parallel processing when available
         replica_manager = get_linear_replica_manager()
         if replica_manager and getattr(replica_manager, '_initialized', False):
             # Try batch splitting across all available replicas
@@ -164,7 +135,6 @@ class Qwen3MLP(nn.Module):
                 remainder = batch_size % num_replicas
 
                 results = []
-                events = []
 
                 # Distribute batch across replicas
                 start_idx = 0
@@ -200,18 +170,10 @@ class Qwen3MLP(nn.Module):
                     x = x.to(gate_up.device, non_blocking=True)
 
                 print(f"DEBUG: Batch-split down_proj completed: {len(replicas)} replicas, batch_size {batch_size}")
-            else:
-                # Fall back to single replica processing
-                replica = replica_manager.get_replica("down_proj", layer_id=layer_id)
-                if replica:
-                    x, completion_event = replica.forward_async(x)
-                    completion_event.synchronize()
-                    if x.device != gate_up.device:
-                        x = x.to(gate_up.device, non_blocking=True)
-                else:
-                    x = self.down_proj(x)
-        else:
-            x = self.down_proj(x)
+                return x
+
+        # Use original down_proj (when no replicas or batch splitting not possible)
+        x = self.down_proj(x)
 
         return x
 

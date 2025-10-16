@@ -1,6 +1,7 @@
 from collections import deque
-import xxhash
+
 import numpy as np
+import xxhash
 
 from nanovllm.engine.sequence import Sequence
 

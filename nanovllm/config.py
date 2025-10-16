@@ -1,6 +1,7 @@
-import os
 import argparse
+import os
 from dataclasses import dataclass, field, fields
+
 from transformers import AutoConfig
 
 
@@ -19,9 +20,8 @@ class Config:
     num_kvcache_blocks: int = -1
 
     # Operator replication options
-    op_replica_configs: dict = field(default_factory=dict)  # e.g., {"attention": 2}
+    op_replica_configs: dict = field(default_factory=dict)  # e.g., {"down_proj": 2}
     replica_devices: list[int] = field(default_factory=list)  # Empty means auto-detect available GPUs
-    enable_op_replica_auto_scaling: bool = False
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -36,13 +36,13 @@ class Config:
             try:
                 import torch
                 self.replica_devices = list(range(torch.cuda.device_count()))
-            except:
+            except Exception:
                 self.replica_devices = [0]  # Fallback to device 0
 
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> 'Config':
         """Create Config from parsed command line arguments."""
-        # Parse op_replica arguments (format: "attention:2,mlp:1")
+        # Parse op_replica arguments (format: "down_proj:2")
         op_replica_configs = {}
         if hasattr(args, 'op_replica') and args.op_replica:
             for config_str in args.op_replica:
@@ -83,16 +83,11 @@ class Config:
             '--op-replica',
             action='append',
             help='Operator replication configuration in format "op_name:num_replicas". '
-                 'Can be specified multiple times. Example: --op-replica attention:2 --op-replica mlp:1'
+                 'Currently supports "down_proj". Example: --op-replica down_proj:2'
         )
         parser.add_argument(
             '--replica-devices',
             type=str,
             help='Comma-separated list of CUDA device indices to use for replicas. '
                  'Default: auto-detect all available GPUs'
-        )
-        parser.add_argument(
-            '--enable-op-replica-auto-scaling',
-            action='store_true',
-            help='Enable automatic scaling of operator replicas based on load'
         )

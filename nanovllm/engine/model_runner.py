@@ -1,14 +1,15 @@
 import pickle
+from multiprocessing.shared_memory import SharedMemory
+from multiprocessing.synchronize import Event
+
 import torch
 import torch.distributed as dist
-from multiprocessing.synchronize import Event
-from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
-from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
-from nanovllm.utils.context import set_context, get_context, reset_context
+from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.utils.context import get_context, reset_context, set_context
 from nanovllm.utils.loader import load_model
 
 
@@ -149,7 +150,7 @@ class ModelRunner:
                 if i != seq.num_blocks - 1:
                     end = start + self.block_size
                 else:
-                    end = start + seq.last_block_num_tokens 
+                    end = start + seq.last_block_num_tokens
                 slot_mapping.extend(list(range(start, end)))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
