@@ -168,6 +168,8 @@ class Qwen3MLP(nn.Module):
 
                 # Distribute batch across replicas
                 start_idx = 0
+                replica_tasks = []  # List of (replica_idx, result_future, event)
+
                 for i, replica in enumerate(replicas):
                     # Calculate split size for this replica (handle remainder)
                     current_split = split_size + (1 if i < remainder else 0)
@@ -177,17 +179,20 @@ class Qwen3MLP(nn.Module):
                     end_idx = start_idx + current_split
                     x_split = x[start_idx:end_idx]
 
+
                     # Execute replica asynchronously
                     result, event = replica.forward_async(x_split)
-                    results.append(result)
-                    events.append(event)
+                    replica_tasks.append((i, result, event))
                     start_idx = end_idx
 
                 # Wait for all replicas to complete
-                for event in events:
+                for _, _, event in replica_tasks:
                     event.synchronize()
 
-                # Concatenate results back together
+                # Concatenate results back together in the correct order
+                # Sort by replica index to ensure proper order
+                replica_tasks.sort(key=lambda x: x[0])
+                results = [result for _, result, _ in replica_tasks]
                 x = torch.cat(results, dim=0)
 
                 # Ensure result is on correct device

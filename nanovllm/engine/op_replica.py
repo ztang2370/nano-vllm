@@ -139,8 +139,8 @@ class OperatorReplica:
                     return args[0] if args else None
             self.op = DummyOp()
 
-        # Create dedicated CUDA stream for this replica to enable true parallelism
-        self.stream = torch.cuda.Stream(self.device)
+        # Use the current stream (same as main execution) to avoid stream issues
+        self.stream = torch.cuda.current_stream(self.device)
 
         # Metrics and state
         self.metrics = ReplicaMetrics()
@@ -543,8 +543,8 @@ class ReplicaManager:
                     self.original_module = original_module
                     self.metrics = ReplicaMetrics()
                     self._lock = threading.Lock()
-                    # Create dedicated CUDA stream for this replica to enable true parallelism
-                    self.stream = torch.cuda.Stream(self.device)
+                    # Use the current stream (same as main execution) to avoid stream issues
+                    self.stream = torch.cuda.current_stream(self.device)
 
                 def forward_async(self, *args, **kwargs):
                     """Execute the original operator."""
